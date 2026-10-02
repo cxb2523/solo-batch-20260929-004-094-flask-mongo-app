@@ -23,6 +23,10 @@
             <p class="text-danger">Incorrect email address or password.<br />Please try again.</p>
             {% endif %}
 
+            {% if reason_message %}
+            <p class="text-warning">Email confirmation failed: {{ reason_message }}</p>
+            {% endif %}
+
             {% if current_user.is_authenticated %}
             <div class="form-group">
                 <a class="btn btn-danger" href="{{ url_for('logout') }}">Logout</a>

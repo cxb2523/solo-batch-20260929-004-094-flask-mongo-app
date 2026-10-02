@@ -4,13 +4,28 @@
     <div class="row">
         <div class="col-md-5 mx-md-auto pt-5">
             {% if success %}
+            {# REDEEM transition completed exactly once #}
             <h1 class="text-primary">Thank you!</h1>
             <h2>Email address verified successfully</h2>
-            <p>
+            <p>Your registration is now active.</p>
             {% else %}
+            {# Inline failure branches: invalid, expired, already active,
+               or user not found. The redirect-to-login path never renders
+               here; it arrives on the login page with ?reason=... #}
             <h1 class="text-primary">There was a problem</h1>
+            {% if outcome == "already_active" %}
+            <h2>Your account is already activated</h2>
+            <p>{{ error_message or "This account has already been activated." }}</p>
+            {% elif outcome == "expired" %}
+            <h2>Your verification link has expired</h2>
+            <p>{{ error_message or "The verification link may be invalid or expired." }}</p>
+            {% elif outcome == "user_not_found" %}
+            <h2>No account found</h2>
+            <p>{{ error_message or "No account exists for this verification link." }}</p>
+            {% else %}
             <h2>Your email address could not be verified</h2>
-            <p>The verification link may be invalid or expired.</p>
+            <p>{{ error_message or "The verification link may be invalid or expired." }}</p>
+            {% endif %}
             {% endif %}
             <hr class="my-3" />
             <p>Go to the <a href="{{ url_for('login') }}" title="Login">login page</a>.</p>

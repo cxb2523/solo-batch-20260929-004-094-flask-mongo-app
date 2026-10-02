@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Token inspection report</title>
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin: 2rem; color: #1f2933; background: #f7f9fb; }
+h1 { margin-bottom: 0; }
+.meta { color: #52606d; margin-top: .25rem; }
+.grid { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
+.stat { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 1rem 1.25rem; min-width: 150px; }
+.stat .num { font-size: 1.8rem; font-weight: 700; }
+table { border-collapse: collapse; width: 100%; background: #fff; }
+th, td { border: 1px solid #e4e7eb; padding: .5rem .75rem; text-align: left; }
+th { background: #edf2f7; }
+.card { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+.pill { display:inline-block; padding:.15rem .6rem; border-radius:999px; background:#e3f2fd; }
+</style>
+</head>
+<body>
+<h1>Token lifecycle inspection report</h1>
+<p class="meta">Generated 2026-10-02 13:43:23 UTC &middot; trigger: <span class="pill">manual</span> &middot; worker runs (cumulative): 1</p>
+
+<h2>This sweep</h2>
+<div class="grid">
+  <div class="stat"><div class="num">0</div><div>expired tokens swept</div></div>
+  <div class="stat"><div class="num">0</div><div>redeemed residue swept</div></div>
+  <div class="stat"><div class="num">0</div><div>total cleaned</div></div>
+</div>
+
+<h2>Confirmation attempts (cumulative)</h2>
+<div class="grid">
+  <div class="stat"><div class="num">0</div><div>total attempts</div></div>
+  <div class="stat"><div class="num">0</div><div>failures shown inline (confirm.html)</div></div>
+  <div class="stat"><div class="num">0</div><div>failures redirected to login</div></div>
+</div>
+<table>
+<thead><tr><th>Outcome</th><th>Count</th></tr></thead>
+<tbody>
+<tr><td>Activated (success)</td><td>0</td></tr>
+<tr><td>Account already active</td><td>0</td></tr>
+<tr><td>Link expired</td><td>0</td></tr>
+<tr><td>Link invalid / rotated</td><td>0</td></tr>
+<tr><td>User does not exist</td><td>0</td></tr>
+</tbody>
+</table>
+
+<h2>Records cleaned in this run</h2>
+<table>
+<thead><tr><th>User</th><th>Reason</th></tr></thead>
+<tbody>
+<tr><td colspan='2'>No records required cleanup this run.</td></tr>
+</tbody>
+</table>
+
+<h2>Design trade-offs</h2>
+<section class='card'><h3>1. Token storage: embedded on the user record vs separate collection</h3><p><strong>Chosen:</strong> Embed the signed token plus an expiry stamp directly on the user document (confirmation_token / token_issued_at / token_expires_at / token_redeemed_at).</p><p><strong>Rejected:</strong> A standalone tokens collection with its own lifecycle.</p><ul><li>Resend rotates the old link: reissuing overwrites the embedded token, so links from older emails can no longer match any record.</li><li>Concurrent double clicks are idempotent while the redeemed residue (token_redeemed_at) is retained: the second click resolves to already_active instead of activating twice.</li><li>There are no orphan token rows to reap across collections; the worker sweep clearing the four fields is the only reaper.</li></ul></section>
+<section class='card'><h3>2. Expiry comparison: UTC strict greater-than vs local / greater-than-or-equal</h3><p><strong>Chosen:</strong> Compare now &gt; token_expires_at using UTC epoch seconds, strict greater-than.</p><p><strong>Rejected:</strong> Local server time with &gt;=, or the serializer&#x27;s own clock.</p><ul><li>UTC avoids a deployed server drifting between timezones/DST versus the issued stamp.</li><li>At the exact boundary second (now == token_expires_at) the link is still valid; &gt;= would expire a link the very instant it is issued when stamps coincide, while a naive/never-set local comparison can make a link live forever.</li></ul></section>
+<section class='card'><h3>3. Confirmation failure: inline branch vs redirect to login</h3><p><strong>Chosen:</strong> Default renders confirm.html inline with an explicit reason branch (invalid / expired / already_active / user_not_found); a redirect-to-login disposition is also implemented and is counted separately.</p><p><strong>Rejected:</strong> Always redirecting every failure to /login with one generic error.</p><ul><li>The two paths are distinguishable in the report: inline_failures vs redirect_failures counters.</li><li>The three failure classes keep their own counters, so &#x27;link invalid&#x27;, &#x27;account already active&#x27; and &#x27;user does not exist&#x27; are never merged into one opaque bucket.</li></ul></section>
+</body>
+</html>
