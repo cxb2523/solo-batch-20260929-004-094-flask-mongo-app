@@ -44,6 +44,7 @@ def send_email(receiver_email, subject, plaintext, html):
     context = ssl.create_default_context()
 
     # Try to log in to server and send email
+    server = None
     try:
         server = smtplib.SMTP(SMTP_SERVER, PORT)
         server.ehlo()
@@ -56,13 +57,16 @@ def send_email(receiver_email, subject, plaintext, html):
         print(e)
         return False
     finally:
-        server.quit()
+        if server is not None:
+            server.quit()
         return True
 
 
 # Convenience function - registration / verification email
 def send_registration_email(user):
-    token = generate_confirmation_token(user.email)
+    # The token is issued and embedded on the user record before sending.
+    # Falling back to signing here keeps the helper usable on its own.
+    token = getattr(user, "confirm_token", None) or generate_confirmation_token(user.email)
     confirm_url = url_for('confirm_email', token=token, _external=True)
     subject = "Registration successful - Please verify your email address."
     plaintext = f"Welcome {user.display_name()}.\nPlease verify your email address by following this link:\n\n{confirm_url}"

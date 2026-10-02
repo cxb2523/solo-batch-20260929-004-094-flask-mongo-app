@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>令牌生命周期巡检报告</title>
+<style>
+body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0;
+       background: #f4f6f8; color: #1f2933; }
+main { max-width: 960px; margin: 0 auto; padding: 32px 20px; }
+h1 { font-size: 26px; margin-bottom: 4px; }
+h2 { font-size: 19px; margin-top: 34px; border-left: 4px solid #2563eb;
+      padding-left: 10px; }
+h3 { font-size: 15px; margin: 18px 0 8px; }
+.meta { color: #64748b; font-size: 13px; }
+.card { background: #fff; border: 1px solid #e2e8f0; border-radius: 8px;
+         padding: 18px 22px; margin-top: 12px; }
+.decision { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px;
+             padding: 10px 14px; margin: 10px 0; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 14px; }
+th, td { border: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; }
+th { background: #f1f5f9; }
+.muted { color: #94a3b8; text-align: center; }
+.pill { display: inline-block; background: #2563eb; color: #fff; border-radius: 999px;
+         padding: 2px 12px; font-size: 12px; }
+ul { margin: 8px 0; }
+code { background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+<h1>令牌生命周期巡检报告</h1>
+<p class="meta">生成时间（UTC）：2026-10-02 23:12:00.788169+00:00 ｜ 当前失败处理模式：
+<span class="pill">confirm.html 就地内联报错</span></p>
+
+<h2>一、令牌存储模型：内嵌用户记录，还是独立集合</h2>
+<div class="card">
+<div class="decision"><strong>取舍决定：</strong>令牌（<code>confirm_token</code>）与过期戳
+（<code>confirm_expires_at</code>）<strong>内嵌在 user 用户记录</strong>上，不另建独立集合。
+核销时写入 <code>verified=True</code> 与 <code>confirmed_at</code> 并摘除令牌字段。</div>
+<ul>
+<li><strong>重发与旧链接：</strong>重发即重签并轮换内嵌令牌；旧链接签名虽仍有效，
+但与库中最新令牌不匹配，按“链接失效”拒绝，旧链接不会延后到期、也不会复活。</li>
+<li><strong>并发双击幂等：</strong>核销用单条条件更新
+<code>{email, confirm_token, verified: False}</code> 完成；同链接并发双击只有一个请求
+匹配成功，另一请求落入“账号已激活”分支，同一条链接全局只生效一次。</li>
+<li><strong>孤儿记录回收：</strong>不存在独立集合即无游离令牌文档；worker 每轮把
+“已验证但令牌字段残留”和“未验证但令牌过期”两类字段从用户记录上摘除，完成孤儿回收。</li>
+</ul>
+</div>
+
+<h2>二、过期比较：UTC 还是本地时间，大于还是大于等于</h2>
+<div class="card">
+<div class="decision"><strong>取舍决定：</strong>存、比一律使用<strong>带时区的 UTC</strong>
+（<code>datetime.now(timezone.utc)</code>），判等采用严格大于
+<code>now &gt; expires</code> 才算过期。</div>
+<ul>
+<li>本地时间比较会随部署主机时区漂移，跨时区用户链接寿命会无故缩短或拉长。</li>
+<li>边界那一秒 <code>now == expires</code> 仍然有效：若用 <code>&gt;=</code>，
+在时间戳取整到同一秒时，刚发出的链接会立刻被判失效；严格大于保证链接至少完整活满 TTL，
+也不会出现永不过期。</li>
+</ul>
+</div>
+
+<h2>三、确认失败的呈现：就地内联，还是统一重定向 login</h2>
+<div class="card">
+<div class="decision"><strong>取舍决定：</strong>两条路径都保留并在下方<strong>按路径分开统计</strong>；
+默认在 <code>confirm.html</code> 就地内联展示具体原因（链接失效 / 账号已激活 / 用户不存在 / 已过期），
+设置 <code>CONFIRM_FAILURE_MODE=redirect</code> 时统一带错误码重定向到 <code>login</code>。</div>
+<ul>
+<li>内联路径保留确认页上下文，用户能区分“过期”与“已激活”等不同原因。</li>
+<li>重定向路径把所有失败收敛到登录页，URL 带 <code>confirm_error</code> 错误码。</li>
+<li>无论走哪条路径，失败原因都写入审计事件，报告矩阵按“原因 × 路径”分别计数，可区分统计。</li>
+</ul>
+</div>
+
+<h2>本轮巡检结果</h2>
+<div class="card">
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>扫描用户数</td><td>3</td></tr><tr><td>本轮过期令牌</td><td>1</td></tr><tr><td>本轮已核销残留</td><td>1</td></tr><tr><td>开始时间（UTC）</td><td>2026-10-02 23:12:00.787169+00:00</td></tr><tr><td>结束时间（UTC）</td><td>2026-10-02 23:12:00.788169+00:00</td></tr></tbody></table>
+<h3>过期令牌对应邮箱</h3><p>grace@example.com</p>
+<h3>已核销残留对应邮箱</h3><p>ada@example.com</p>
+</div>
+
+<h2>生命周期迁移累计</h2>
+<div class="card">
+<table><thead><tr><th>迁移</th><th>次数</th></tr></thead><tbody><tr><td>签发</td><td>2</td></tr><tr><td>核销</td><td>1</td></tr><tr><td>过期（worker 清理）</td><td>1</td></tr><tr><td>已核销残留清理</td><td>1</td></tr></tbody></table>
+</div>
+
+<h2>确认结果 × 呈现路径统计</h2>
+<div class="card">
+<table><thead><tr><th>确认结果</th><th>内联路径</th><th>重定向 login 路径</th><th>合计</th></tr></thead><tbody><tr><td>核销成功</td><td>1</td><td>0</td><td>1</td></tr><tr><td>链接失效（签名错误/已被轮换）</td><td>1</td><td>1</td><td>2</td></tr><tr><td>令牌已过期</td><td>1</td><td>1</td><td>2</td></tr><tr><td>账号已激活（重复点击）</td><td>1</td><td>0</td><td>1</td></tr><tr><td>用户不存在</td><td>0</td><td>0</td><td>0</td></tr></tbody></table>
+<h3>路径汇总</h3>
+<table><thead><tr><th>路径</th><th>尝试次数</th></tr></thead><tbody><tr><td>confirm.html 就地内联报错</td><td>4</td></tr><tr><td>统一重定向到 login</td><td>2</td></tr></tbody></table>
+</div>
+</main>
+</body>
+</html>

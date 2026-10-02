@@ -3,18 +3,38 @@
 <div class="container">
     <div class="row">
         <div class="col-md-5 mx-md-auto pt-5">
-            {% if success %}
+            {% if outcome == "success" %}
             <h1 class="text-primary">Thank you!</h1>
             <h2>Email address verified successfully</h2>
-            <p>
+            <p>Your account is now active. Re-opening this link has no further effect.</p>
+
+            {% elif outcome == "expired" %}
+            <h1 class="text-danger">Link expired</h1>
+            <h2>Your verification link is no longer valid</h2>
+            <p>The confirmation token passed its UTC expiry time. Sign in and request a
+               new verification email.</p>
+
+            {% elif outcome == "already_active" %}
+            <h1 class="text-warning">Already verified</h1>
+            <h2>Your account is already active</h2>
+            <p>This link was already used. A repeated or double-clicked link cannot
+               activate the account twice.</p>
+
+            {% elif outcome == "no_user" %}
+            <h1 class="text-danger">Account not found</h1>
+            <h2>No account matches this link</h2>
+            <p>The user record does not exist or may have been deleted.</p>
+
             {% else %}
-            <h1 class="text-primary">There was a problem</h1>
+            {# invalid_token: bad signature, rotated away by a resend, or swept clean #}
+            <h1 class="text-danger">Invalid link</h1>
             <h2>Your email address could not be verified</h2>
-            <p>The verification link may be invalid or expired.</p>
+            <p>The verification link is malformed or was replaced by a newer one.
+               Request a fresh verification email.</p>
             {% endif %}
+
             <hr class="my-3" />
             <p>Go to the <a href="{{ url_for('login') }}" title="Login">login page</a>.</p>
-            </div>
         </div>
     </div>
 </div>

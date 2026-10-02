@@ -23,6 +23,16 @@
             <p class="text-danger">Incorrect email address or password.<br />Please try again.</p>
             {% endif %}
 
+            {% if confirm_error == "expired" %}
+            <p class="text-danger">Your verification link has expired. Sign in to request a new one.</p>
+            {% elif confirm_error == "already_active" %}
+            <p class="text-warning">Your account is already verified; the link was already used.</p>
+            {% elif confirm_error == "no_user" %}
+            <p class="text-danger">No account matches that verification link.</p>
+            {% elif confirm_error == "invalid_token" %}
+            <p class="text-danger">That verification link is invalid or was replaced.</p>
+            {% endif %}
+
             {% if current_user.is_authenticated %}
             <div class="form-group">
                 <a class="btn btn-danger" href="{{ url_for('logout') }}">Logout</a>

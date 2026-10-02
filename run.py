@@ -1,343 +1,402 @@
-# MODULE IMPORTS
+"""Application entry point: Flask web app and token-lifecycle worker.
 
-# Flask modules
-from flask import Flask, render_template, request, url_for, request, redirect, abort
-from flask_login import LoginManager, login_user, logout_user, login_required, current_user
-from flask_talisman import Talisman
-from flask_pymongo import PyMongo
-from flask_bcrypt import Bcrypt
-from flask_wtf.csrf import CSRFProtect
+Run modes:
 
-# Other modules
-from urllib.parse import urlparse, urljoin
-from datetime import datetime
+    python run.py                       # web server
+    python run.py worker                # one manual sweep, writes reports/
+    python run.py worker --interval 60  # scheduled sweep loop (seconds)
+
+Both the data store and the audit log are injectable; with no MongoDB
+configuration the app runs fully offline against an in-memory fake store.
+"""
+
+import argparse
 import configparser
-import json
-import sys
 import os
+import time
+from urllib.parse import urljoin, urlparse
 
-# Local imports
-from user import User, Anonymous
+from flask import Flask, abort, redirect, render_template, request, url_for
+from flask_bcrypt import Bcrypt
+from flask_login import (
+    AnonymousUserMixin,
+    LoginManager,
+    current_user,
+    login_required,
+    login_user,
+    logout_user,
+)
+
+import events
+import report as report_module
+import worker
+from email_utility import send_message_email, send_registration_email
 from message import Message
 from note import Note
-from email_utility import send_email, send_registration_email, send_message_email
-from verification import confirm_token
+from store import FakeDataStore, default_store
+from user import User
 
 
-# Create app
-app = Flask(__name__)
-
-# Configuration
-config = configparser.ConfigParser()
-config.read('configuration.ini')
-default = config['DEFAULT']
-app.secret_key = default['SECRET_KEY']
-app.config['MONGO_DBNAME'] = os.environ.get('MONGO_DBNAME')
-app.config['MONGO_URI'] = os.environ.get('MONGODB_URI') #default['MONGO_URI']
-app.config['PREFERRED_URL_SCHEME'] = "https"
-
-# Create Pymongo
-mongo = PyMongo(app)
-
-# Create Bcrypt
-bc = Bcrypt(app)
-
-# Create Talisman
-csp = {
-    'default-src': [
-        '\'self\'',
-        'https://stackpath.bootstrapcdn.com',
-        'https://pro.fontawesome.com',
-        'https://code.jquery.com',
-        'https://cdnjs.cloudflare.com'
-    ]
-}
-talisman = Talisman(app, content_security_policy=csp)
-
-# Create CSRF protect
-csrf = CSRFProtect()
-csrf.init_app(app)
-
-# Create login manager
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.anonymous_user = Anonymous
-login_manager.login_view = "login"
+def read_secret_key():
+    parser = configparser.ConfigParser()
+    parser.read("configuration.ini")
+    defaults = parser.defaults()
+    return os.environ.get(
+        "SECRET_KEY", defaults.get("SECRET_KEY", "development-secret-key"))
 
 
-# ROUTES
+def create_app(store=None, event_log=None, config=None):
+    app = Flask(__name__)
+    config = dict(config or {})
+    app.secret_key = config.get("SECRET_KEY", read_secret_key())
+    app.config["WTF_CSRF_ENABLED"] = config.get("WTF_CSRF_ENABLED", True)
+    app.config["TESTING"] = config.get("TESTING", False)
+    app.config["PREFERRED_URL_SCHEME"] = "http"
 
-# Index
-@app.route('/')
-def index():
-    return render_template('index.html')
+    app.extensions["data_store"] = (
+        store if store is not None else default_store())
+    app.extensions["event_log"] = (
+        event_log if event_log is not None else events.InMemoryEventLog())
+    failure_mode = config.get(
+        "CONFIRM_FAILURE_MODE",
+        os.environ.get("CONFIRM_FAILURE_MODE", worker.INLINE))
+    if failure_mode not in (worker.INLINE, worker.REDIRECT):
+        failure_mode = worker.INLINE
+    app.config["CONFIRM_FAILURE_MODE"] = failure_mode
 
+    bc = Bcrypt(app)
 
-# Login
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'GET':
-        if current_user.is_authenticated:
-            # Redirect to index if already authenticated
-            return redirect(url_for('/index'))
-        # Render login page
-        return render_template('login.html', error=request.args.get("error"))
-    # Retrieve user from database
-    users = mongo.db.users
-    user_data = users.find_one({'email': request.form['email']}, {'_id': 0})
-    if user_data:
-        # Check password hash
-        if bc.check_password_hash(user_data['password'], request.form['pass']):
-            # Create user object to login (note password hash not stored in session)
+    login_manager = LoginManager()
+    login_manager.init_app(app)
+    login_manager.anonymous_user = AnonymousUserMixin
+    login_manager.login_view = "login"
+
+    if app.config["WTF_CSRF_ENABLED"]:
+        from flask_wtf.csrf import CSRFProtect
+        CSRFProtect(app)
+    else:
+        app.jinja_env.globals["csrf_token"] = lambda: ""
+
+    def is_safe_url(target):
+        ref_url = urlparse(request.host_url)
+        test_url = urlparse(urljoin(request.host_url, target))
+        return test_url.scheme in ("http", "https") and \
+            ref_url.netloc == test_url.netloc
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "GET":
+            if current_user.is_authenticated:
+                return redirect(url_for("index"))
+            return render_template(
+                "login.html",
+                error=request.args.get("error"),
+                confirm_error=request.args.get("confirm_error"))
+        user_data = store.find_one(
+            "users", {"email": request.form["email"]}, {"_id": 0})
+        if user_data and bc.check_password_hash(
+                user_data["password"], request.form["pass"]):
             user = User.make_from_dict(user_data)
             login_user(user)
-
-            # Check for next argument (direct user to protected page they wanted)
-            next = request.args.get('next')
-            if not is_safe_url(next):
+            next_url = request.args.get("next")
+            if not is_safe_url(next_url):
                 return abort(400)
+            return redirect(next_url or url_for("profile"))
+        return redirect(url_for("login", error=1))
 
-            # Go to profile page after login
-            return redirect(next or url_for('profile'))
+    @app.route("/register", methods=["POST", "GET"])
+    def register():
+        if request.method == "GET":
+            return render_template(
+                "register.html", error=request.args.get("error"))
 
-    # Redirect to login page on error
-    return redirect(url_for('login', error=1))
+        email = request.form["email"].strip()
+        title = request.form["title"].strip()
+        first_name = request.form["first_name"].strip()
+        last_name = request.form["last_name"].strip()
+        password = request.form["pass"].strip()
 
+        if store.find_one("users", {"email": email}, {"_id": 0}) is not None:
+            return redirect(url_for("register", error=1))
 
-# Register
-@app.route('/register', methods=['POST', 'GET'])
-def register():
-    if request.method == 'POST':
-        # Trim input data
-        email = request.form['email'].strip()
-        title = request.form['title'].strip()
-        first_name = request.form['first_name'].strip()
-        last_name = request.form['last_name'].strip()
-        password = request.form['pass'].strip()
+        logout_user()
+        new_user = User(title, first_name, last_name, email)
+        user_data = new_user.dict()
+        user_data["password"] = bc.generate_password_hash(
+            password).decode("utf-8")
 
-        users = mongo.db.users
-        # Check if email address already exists
-        existing_user = users.find_one(
-            {'email': email}, {'_id': 0})
+        if not store.insert_one("users", user_data):
+            return redirect(url_for("register", error=2))
 
-        if existing_user is None:
-            logout_user()
-            # Hash password
-            hashpass = bc.generate_password_hash(password).decode('utf-8')
-            # Create user object (note password hash not stored in session)
-            new_user = User(title, first_name, last_name, email)
-            # Create dictionary data to save to database
-            user_data_to_save = new_user.dict()
-            user_data_to_save['password'] = hashpass
+        # Issue -> embedded token + UTC expiry stamp on the user record.
+        worker.issue_token(store, new_user, event_log=event_log)
+        login_user(new_user)
+        try:
+            send_registration_email(new_user)
+        except Exception:
+            # Offline / no SMTP configured: registration still succeeds.
+            pass
+        return redirect(url_for("profile"))
 
-            # Insert user record to database
-            if users.insert_one(user_data_to_save):
-                login_user(new_user)
-                send_registration_email(new_user)
-                return redirect(url_for('profile'))
-            else:
-                # Handle database error
-                return redirect(url_for('register', error=2))
+    @app.route("/confirm/<token>", methods=["GET"])
+    def confirm_email(token):
+        logout_user()
+        outcome, _user = worker.attempt_confirmation(
+            store, token, path=failure_mode, event_log=event_log)
+        if outcome == worker.SUCCESS:
+            return render_template("confirm.html", outcome=outcome)
+        if failure_mode == worker.REDIRECT:
+            return redirect(url_for("login", confirm_error=outcome))
+        return render_template("confirm.html", outcome=outcome), 200
 
-        # Handle duplicate email
-        return redirect(url_for('register', error=1))
-
-    # Return template for registration page if GET request
-    return render_template('register.html', error=request.args.get("error"))
-
-
-# Confirm email
-@app.route('/confirm/<token>', methods=['GET'])
-def confirm_email(token):
-    logout_user()
-    try:
-        email = confirm_token(token)
-        if email:
-            if mongo.db.users.update_one({"email": email}, {"$set": {"verified": True}}):
-                return render_template('confirm.html', success=True)
-    except:
-        return render_template('confirm.html', success=False)
-    else:
-        return render_template('confirm.html', success=False)
-
-
-# Verification email
-@app.route('/verify', methods=['POST'])
-@login_required
-def send_verification_email():
-    if current_user.verified == False:
-        send_registration_email(current_user)
+    @app.route("/verify", methods=["POST"])
+    @login_required
+    def send_verification_email():
+        if current_user.verified:
+            return "Your email address is already verified"
+        # Resend rotates the embedded token and invalidates the old link.
+        worker.issue_token(store, current_user, event_log=event_log)
+        try:
+            send_registration_email(current_user)
+        except Exception:
+            pass
         return "Verification email sent"
-    else:
-        return "Your email address is already verified"
 
+    @app.route("/profile", methods=["GET"])
+    @login_required
+    def profile():
+        notes = store.find(
+            "notes", {"user_id": current_user.id, "deleted": False})
+        if hasattr(notes, "sort"):
+            notes = notes.sort("timestamp", -1)
+        return render_template("profile.html", notes=notes,
+                               title=current_user.title)
 
-# Profile
-@app.route('/profile', methods=['GET'])
-@login_required
-def profile():
-    notes = mongo.db.notes.find(
-        {"user_id": current_user.id, "deleted": False}).sort("timestamp", -1)
-    return render_template('profile.html', notes=notes, title=current_user.title)
+    @app.route("/messages", methods=["GET"])
+    @login_required
+    def messages():
+        all_users = store.find(
+            "users", {"id": {"$ne": current_user.id}}, {"_id": 0})
+        inbox = store.find(
+            "messages", {"to_id": current_user.id, "deleted": False})
+        if hasattr(inbox, "sort"):
+            inbox = inbox.sort("timestamp", -1)
+        sent = store.find(
+            "messages",
+            {"from_id": current_user.id, "deleted": False,
+             "hidden_for_sender": False})
+        if hasattr(sent, "sort"):
+            sent = sent.sort("timestamp", -1)
+        return render_template(
+            "messages.html", users=all_users,
+            inbox_messages=inbox, sent_messages=sent)
 
+    @app.route("/logout", methods=["GET"])
+    @login_required
+    def logout():
+        logout_user()
+        return redirect(url_for("index"))
 
-# Messages
-@app.route('/messages', methods=['GET'])
-@login_required
-def messages():
-    all_users = mongo.db.users.find(
-        {"id": {"$ne": current_user.id}}, {'_id': 0})
-    inbox_messages = mongo.db.messages.find(
-        {"to_id": current_user.id, "deleted": False}).sort("timestamp", -1)
-    sent_messages = mongo.db.messages.find(
-        {"from_id": current_user.id, "deleted": False, "hidden_for_sender": False}).sort("timestamp", -1)
-    return render_template('messages.html', users=all_users, inbox_messages=inbox_messages, sent_messages=sent_messages)
-
-
-# Logout
-@app.route('/logout', methods=['GET'])
-@login_required
-def logout():
-    logout_user()
-    return redirect(url_for('index'))
-
-
-# POST REQUEST ROUTES
-
-# Add note
-@app.route('/add_note', methods=['POST'])
-@login_required
-def add_note():
-    title = request.form.get("title")
-    body = request.form.get("body")
-    user_id = current_user.id
-    user_name = current_user.display_name()
-    note = Note(title, body, user_id, user_name)
-    if mongo.db.notes.insert_one(note.dict()):
-        return "Success! Note added: " + title
-    else:
+    @app.route("/add_note", methods=["POST"])
+    @login_required
+    def add_note():
+        note = Note(request.form.get("title"), request.form.get("body"),
+                    current_user.id, current_user.display_name())
+        if store.insert_one("notes", note.dict()):
+            return "Success! Note added: " + note.title
         return "Error! Could not add note"
 
-
-# Delete note
-@app.route('/delete_note', methods=['POST'])
-@login_required
-def delete_note():
-    note_id = request.form.get("note_id")
-    if mongo.db.notes.update_one({"id": note_id}, {"$set": {"deleted": True}}):
-        return "Success! Note deleted"
-    else:
+    @app.route("/delete_note", methods=["POST"])
+    @login_required
+    def delete_note():
+        if store.update_one("notes", {"id": request.form.get("note_id")},
+                            {"$set": {"deleted": True}}):
+            return "Success! Note deleted"
         return "Error! Could not delete note"
 
-
-# Send message
-@app.route('/send_message', methods=['POST'])
-@login_required
-def send_message():
-    title = request.form.get("title")
-    body = request.form.get("body")
-    from_id = current_user.id
-    from_name = current_user.display_name()
-    to_id = request.form.get("user")
-    to_user_dict = mongo.db.users.find_one({"id": to_id})
-    to_user = User.make_from_dict(to_user_dict)
-    to_name = to_user.display_name()
-    message = Message(title, body, from_id, from_name, to_id, to_name)
-    if mongo.db.messages.insert_one(message.dict()):
-        send_message_email(from_user=current_user,
-                           to_user=to_user, message=message)
-        return "Success! Message sent to " + to_name + ": " + title
-    else:
+    @app.route("/send_message", methods=["POST"])
+    @login_required
+    def send_message():
+        to_user_dict = store.find_one(
+            "users", {"id": request.form.get("user")})
+        if not to_user_dict:
+            return "Error! Recipient not found"
+        to_user = User.make_from_dict(to_user_dict)
+        message = Message(
+            request.form.get("title"), request.form.get("body"),
+            current_user.id, current_user.display_name(),
+            to_user.id, to_user.display_name())
+        if store.insert_one("messages", message.dict()):
+            try:
+                send_message_email(from_user=current_user, to_user=to_user,
+                                   message=message)
+            except Exception:
+                pass
+            return "Success! Message sent to " + to_user.display_name()
         return "Error! Could not send message"
 
-
-# Delete message
-@app.route('/delete_message', methods=['POST'])
-@login_required
-def delete_message():
-    message_id = request.form.get("message_id")
-    if mongo.db.messages.update_one({"id": message_id}, {"$set": {"deleted": True}}):
-        return "Success! Message deleted"
-    else:
+    @app.route("/delete_message", methods=["POST"])
+    @login_required
+    def delete_message():
+        if store.update_one("messages", {"id": request.form.get("message_id")},
+                            {"$set": {"deleted": True}}):
+            return "Success! Message deleted"
         return "Error! Could not delete message"
 
-
-# Hide sent message
-@app.route('/hide_sent_message', methods=['POST'])
-@login_required
-def hide_sent_message():
-    message_id = request.form.get("message_id")
-    if mongo.db.messages.update_one({"id": message_id}, {"$set": {"hidden_for_sender": True}}):
-        return "Success! Message hidden from sender"
-    else:
+    @app.route("/hide_sent_message", methods=["POST"])
+    @login_required
+    def hide_sent_message():
+        if store.update_one("messages", {"id": request.form.get("message_id")},
+                            {"$set": {"hidden_for_sender": True}}):
+            return "Success! Message hidden from sender"
         return "Error! Could not hide message"
 
-
-# Change Name
-@app.route('/change_name', methods=['POST'])
-@login_required
-def change_name():
-    title = request.form['title'].strip()
-    first_name = request.form['first_name'].strip()
-    last_name = request.form['last_name'].strip()
-
-    if mongo.db.users.update_one({"email": current_user.email}, {"$set": {"title": title, "first_name": first_name, "last_name": last_name}}):
-        return "User name updated successfully"
-    else:
+    @app.route("/change_name", methods=["POST"])
+    @login_required
+    def change_name():
+        fields = {
+            "title": request.form["title"].strip(),
+            "first_name": request.form["first_name"].strip(),
+            "last_name": request.form["last_name"].strip()}
+        if store.update_one("users", {"email": current_user.email},
+                            {"$set": fields}):
+            return "User name updated successfully"
         return "Error! Could not update user name"
 
+    @app.route("/delete_account", methods=["POST"])
+    @login_required
+    def delete_account():
+        user_id = current_user.id
+        user_deleted = bool(store.delete_one("users", {"id": user_id}))
+        if user_deleted:
+            logout_user()
+        notes_deleted = bool(store.delete_many("notes", {"user_id": user_id}))
+        messages_deleted = bool(store.delete_many(
+            "messages",
+            {"$or": [{"from_id": user_id}, {"to_id": user_id}]}))
+        return {"user_deleted": user_deleted, "notes_deleted": notes_deleted,
+                "messages_deleted": messages_deleted}
 
-# Delete Account
-@app.route('/delete_account', methods=['POST'])
-@login_required
-def delete_account():
-    user_id = current_user.id
+    @login_manager.user_loader
+    def load_user(userid):
+        user = store.find_one("users", {"id": userid}, {"_id": 0})
+        if user:
+            return User.make_from_dict(user)
+        return None
 
-    # Deletion flags
-    user_deleted = False
-    notes_deleted = False
-    messages_deleted = False
-
-    # Delete user details
-    if mongo.db.users.delete_one({"id": user_id}):
-        user_deleted = True
-        logout_user()
-
-    # Delete notes
-    if mongo.db.notes.delete_many({"user_id": user_id}):
-        notes_deleted = True
-
-    # Delete messages
-    if mongo.db.messages.delete_many({"$or": [{"from_id": user_id}, {"to_id": user_id}]}):
-        messages_deleted = True
-
-    return {"user_deleted": user_deleted, "notes_deleted": notes_deleted, "messages_deleted": messages_deleted}
+    return app
 
 
-# LOGIN MANAGER REQUIREMENTS
-
-# Load user from user ID
-@login_manager.user_loader
-def load_user(userid):
-    # Return user object or none
-    users = mongo.db.users
-    user = users.find_one({'id': userid}, {'_id': 0})
-    if user:
-        return User.make_from_dict(user)
-    return None
+def run_worker_once(store, event_log, reports_dir, failure_mode=worker.INLINE):
+    result = worker.sweep(store, event_log=event_log)
+    path = report_module.write_report(
+        reports_dir, result, event_log, failure_mode=failure_mode)
+    return result, path
 
 
-# Safe URL
-def is_safe_url(target):
-    ref_url = urlparse(request.host_url)
-    test_url = urlparse(urljoin(request.host_url, target))
-    return test_url.scheme in ('http', 'https') and \
-        ref_url.netloc == test_url.netloc
+def seed_demo_data(store, event_log):
+    """Seed an offline demo store and drive the confirmation state machine."""
+    from datetime import timedelta
+
+    from verification import utcnow
+
+    moment = utcnow()
+
+    # Active user carrying stale token residue.
+    active = User("", "Ada", "Lovelace", "ada@example.com", verified=True)
+    active.confirmed_at = moment - timedelta(days=1)
+    record = active.dict()
+    record["confirm_token"] = "stale-residue-token"
+    record["confirm_expires_at"] = moment - timedelta(hours=2)
+    store.insert_one("users", record)
+
+    # User whose token is expired and was never redeemed.
+    stale = User("", "Grace", "Hopper", "grace@example.com")
+    store.insert_one("users", stale.dict())
+    expired_token, _expiry, _ = worker.issue_token(
+        store, stale, ttl_seconds=-3600, event_log=event_log, now=moment)
+
+    # Fresh user: first click succeeds, the double-click is idempotent.
+    fresh = User("", "Alan", "Turing", "alan@example.com")
+    store.insert_one("users", fresh.dict())
+    fresh_token, _exp, _ = worker.issue_token(
+        store, fresh, event_log=event_log, now=moment)
+    worker.attempt_confirmation(
+        store, fresh_token, path=worker.INLINE, event_log=event_log, now=moment)
+    worker.attempt_confirmation(
+        store, fresh_token, path=worker.INLINE, event_log=event_log, now=moment)
+
+    # Failure reasons exercised on both rendering paths.
+    worker.attempt_confirmation(
+        store, "garbage.token.value", path=worker.INLINE,
+        event_log=event_log, now=moment)
+    worker.attempt_confirmation(
+        store, "garbage.token.value", path=worker.REDIRECT,
+        event_log=event_log, now=moment)
+    worker.attempt_confirmation(
+        store, expired_token, path=worker.INLINE,
+        event_log=event_log, now=moment)
+    worker.attempt_confirmation(
+        store, expired_token, path=worker.REDIRECT,
+        event_log=event_log, now=moment)
 
 
-# Heroku environment
-if os.environ.get('APP_LOCATION') == 'heroku':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-else:
-    app.run(host='localhost', port=8080, debug=True)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Flask token lifecycle app")
+    sub = parser.add_subparsers(dest="command")
+    worker_parser = sub.add_parser("worker", help="run the sweep worker")
+    worker_parser.add_argument(
+        "--interval", type=int, default=0,
+        help="scheduled mode: seconds between sweeps (0 = run once)")
+    worker_parser.add_argument(
+        "--reports-dir",
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "reports"))
+    worker_parser.add_argument(
+        "--seed-demo", action="store_true",
+        help="seed a throwaway in-memory store with demo activity")
+    args = parser.parse_args(argv)
+
+    if args.command == "worker":
+        failure_mode = os.environ.get("CONFIRM_FAILURE_MODE", worker.INLINE)
+        if failure_mode not in (worker.INLINE, worker.REDIRECT):
+            failure_mode = worker.INLINE
+        os.makedirs(args.reports_dir, exist_ok=True)
+        if args.seed_demo:
+            store = FakeDataStore()
+            event_log = events.InMemoryEventLog()
+            seed_demo_data(store, event_log)
+        else:
+            store = default_store()
+            event_log = events.JsonlEventLog(
+                os.path.join(args.reports_dir, "events.jsonl"))
+
+        def cycle():
+            result, path = run_worker_once(
+                store, event_log, args.reports_dir, failure_mode)
+            print(f"sweep: scanned={result.users_scanned} "
+                  f"expired={result.expired_tokens} "
+                  f"residue={result.confirmed_residue} report={path}")
+
+        if args.interval and args.interval > 0:
+            while True:
+                cycle()
+                time.sleep(args.interval)
+        else:
+            cycle()
+        return 0
+
+    app = create_app()
+    if os.environ.get("APP_LOCATION") == "heroku":
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    else:
+        app.run(host="localhost", port=8080, debug=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
